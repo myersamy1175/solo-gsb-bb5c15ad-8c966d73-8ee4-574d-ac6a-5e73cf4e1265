@@ -6,11 +6,16 @@
   内读数的温度、湿度**中位数**（偶数样本取中间两数均值）；窗口内读数
   少于 ``min_baseline_samples`` 时抛 :class:`InsufficientBaselineSamples`；
 - **事件后**取窗口 ``(event_ts, event_ts + horizon_seconds]`` 内的读数，
-  视为**分段线性**曲线，对温度、湿度两个维度分别精确求出进入/离开
-  容差带 ``[中位数 − 容差, 中位数 + 容差]``（**含边界**）的交点；
-- 仅当两维**同时**在带内、且相邻读数间隔不超过 ``max_gap_seconds``
-  （恰好等于仍连续）地连续保持 **≥** ``hold_seconds`` 时才判定恢复：
-  任一维出带或采样间隔超限即中断并重新计时；
+  视为**分段线性**曲线。**恰好落在事件时刻的读数仍计入基线**，同时
+  作为事件后**首段曲线的左端点**，与首条严格晚于事件的读数构成首条
+  线段（两点间隔不超过 ``max_gap_seconds`` 时该段有效）；随后对温度、
+  湿度两个维度分别精确求出进入/离开容差带
+  ``[中位数 − 容差, 中位数 + 容差]``（**含边界**）的交点；
+- 首段与后续有效线段在读数时刻相接时**连续计时**（容差带含边界，
+  单点相接不中断）；仅当两维**同时**在带内、且相邻读数间隔不超过
+  ``max_gap_seconds``（恰好等于仍连续）地连续保持 **≥**
+  ``hold_seconds`` 时才判定恢复：任一维出带或采样间隔超限即中断并
+  重新计时，断档两侧绝不合并；
 - ``recovered_at`` 为成功保持段的起点（两维同时入带的精确交点）加上
   ``hold_seconds`` 的确认时刻，``recovery_seconds`` 为其相对事件时刻
   的秒数；
@@ -204,19 +209,29 @@ def analyze_recovery(
     # 事件后窗口：严格晚于 event_ts、不晚于 horizon_end
     post = [s for s in ordered if event_ts < s.ts <= horizon_end]
 
+    # 事件时刻的读数计入基线，同时作为事件后首段曲线的左端点；同一时刻
+    # 多条读数（合并后的正常数据不会出现）取最后一条，保持结果确定。
+    at_event = next((s for s in reversed(ordered) if s.ts == event_ts), None)
+
     t_dev = _max_deviation(post, "temperature", temp_median)
     h_dev = _max_deviation(post, "humidity", hum_median)
 
     # 逐采样区间求“两维同时在带内”的子区间；间隔超 max_gap 直接跳过，
-    # 断档两侧的片天然不会相接合并。
+    # 断档两侧的片天然不会相接合并。首段左端点为事件时刻读数（若有），
+    # 首条事件后读数与它构成首段；没有事件时刻读数时首段不存在。
+    segments: list[tuple[_SampleLike, _SampleLike]] = []
+    if at_event is not None and post:
+        segments.append((at_event, post[0]))
+    segments.extend((post[i], post[i + 1]) for i in range(len(post) - 1))
+
     pieces: list[tuple[dt.datetime, dt.datetime]] = []
-    for i in range(len(post) - 1):
-        t0, t1 = post[i].ts, post[i + 1].ts
+    for s0, s1 in segments:
+        t0, t1 = s0.ts, s1.ts
         span = (t1 - t0).total_seconds()
         if span <= 0.0 or span > max_gap_seconds:
             continue
-        tf = _band_fractions(post[i].temperature, post[i + 1].temperature, t_lo, t_hi)
-        hf = _band_fractions(post[i].humidity, post[i + 1].humidity, h_lo, h_hi)
+        tf = _band_fractions(s0.temperature, s1.temperature, t_lo, t_hi)
+        hf = _band_fractions(s0.humidity, s1.humidity, h_lo, h_hi)
         if tf is None or hf is None:
             continue
         a = max(tf[0], hf[0])  # 两维同时入带 = 两维带内区间的交集

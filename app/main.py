@@ -64,9 +64,10 @@ app = FastAPI(
         "固定步长插值、正负时滞皮尔逊相关的跨展柜环境传播分析（只读）；"
         "并基于 Magnus 公式露点与表面温度的冷凝裕量提供冷凝风险窗口"
         "检测（线性插值阈值交点、断档/零湿度断开、最短持续过滤，只读）；"
-        "并提供展柜扰动恢复分析：以事件前温湿度中位数为基线，事件后按分段"
-        "线性曲线精确求双维进入/离开容差带交点，两维同时在带连续保持达标"
-        "方判恢复（只读）。"
+        "并提供展柜扰动恢复分析：以事件前温湿度中位数为基线，事件时刻读数"
+        "仍计入基线并作为事件后首段曲线左端点，事件后按分段线性曲线精确求"
+        "双维容差带交集的进入/离开交点，两维同时在带连续保持达标方判恢复"
+        "（只读）。"
     ),
     version="1.7.0",
     lifespan=lifespan,
@@ -451,11 +452,11 @@ def get_condensation_risk(
     "/api/v1/cases/{device_sn}/recovery",
     response_model=RecoveryOut,
     tags=["cases"],
-    summary="扰动恢复：事件前中位数基线 + 事件后双维容差带精确进入/离开交点",
+    summary="扰动恢复：事件前中位数基线（事件时刻读数兼作首段左端点）+ 双维容差带精确交点",
 )
 def get_recovery(
     device_sn: str,
-    event_ts: dt.datetime = Query(..., description="扰动事件时刻（含），ISO8601；基线窗口止于该时刻"),
+    event_ts: dt.datetime = Query(..., description="扰动事件时刻（含），ISO8601；基线窗口止于该时刻，恰在该时刻的读数计入基线并作为事件后首段曲线左端点"),
     baseline_seconds: float = Query(..., gt=0.0, description="事件前基线窗口长度（秒，必须为正）"),
     horizon_seconds: float = Query(..., gt=0.0, description="事件后观察窗长度（秒，必须为正）"),
     min_baseline_samples: int = Query(
