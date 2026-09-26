@@ -98,6 +98,160 @@ def test_reading_exactly_at_event_ts_counts_as_baseline():
     assert r.post_event_sample_count == 1
 
 
+# ---------- 事件时刻读数兼作首段左端点 ----------
+
+
+def test_first_segment_event_reading_in_band_reaches_hold():
+    # 事件时刻读数（20, 50）仍计入基线，同时是首段左端点：首段
+    # [01:00, 01:05] 两维恒在带内，恰好等于 hold=300s 即确认恢复。
+    # 旧实现漏算首段：唯一事件后读数 01:05 没有任何区间，必判未恢复。
+    samples = BASELINE + [
+        Sample(EVENT, 20.0, 50.0),
+        _at(65, 20.0, 50.0),
+    ]
+    ok = analyze_recovery(samples, **{**KW, "hold_seconds": 300.0})
+    assert ok.recovered is True
+    assert ok.band_enter_ts == EVENT
+    assert ok.recovered_at == EVENT + dt.timedelta(seconds=300.0)
+    assert ok.recovery_seconds == pytest.approx(300.0)
+    # hold 再多 1 秒：首段恰好 300s，不足确认
+    short = analyze_recovery(samples, **{**KW, "hold_seconds": 301.0})
+    assert short.recovered is False
+    assert short.reason == DWELL_INCOMPLETE_AT_HORIZON
+    # 首段持续到观测末点但保持不足，仍不返回成功保持段起点
+    assert short.band_enter_ts is None
+
+
+def test_first_segment_interpolated_entry_within_first_segment():
+    # 事件时刻读数冲出带外（24, 58）但仍计入中位数基线；首段
+    # [01:00, 01:10] 线性回到带心，温度、湿度均在 75% 处（+7.5min，
+    # 即 01:07:30）同时入带，首段内在带持续恰为 150s；hold=150
+    # 恰在首段终点 01:10 确认。
+    samples = BASELINE + [
+        Sample(EVENT, 24.0, 58.0),
+        _at(70, 20.0, 50.0),
+    ]
+    r = analyze_recovery(samples, **{**KW, "hold_seconds": 150.0})
+    assert r.recovered is True
+    assert r.band_enter_ts == BASE + dt.timedelta(minutes=67.5)
+    assert r.recovered_at == BASE + dt.timedelta(minutes=70.0)
+    assert r.recovery_seconds == pytest.approx(600.0)
+    # 旧实现下唯一事件后读数没有相邻区间，不会恢复
+    assert r.post_event_sample_count == 1
+    # 首段在带仅 150s，hold 再多 1 秒即不足，且保持延伸到观测末点
+    short = analyze_recovery(samples, **{**KW, "hold_seconds": 151.0})
+    assert short.recovered is False
+    assert short.reason == DWELL_INCOMPLETE_AT_HORIZON
+
+
+def test_first_segment_gap_over_max_gap_is_dropped():
+    # 事件时刻读数在带内，但与首条事件后读数间隔 900s > max_gap=600：
+    # 首段断开，事件时刻的在带状态不得带入后续计时；之后 01:15 起
+    # 连续在带，保持计时只能从 01:15 重新开始。
+    samples = BASELINE + [
+        Sample(EVENT, 20.0, 50.0),
+        _at(75, 20.0, 50.0),
+        _at(80, 20.0, 50.0),
+    ]
+    r = analyze_recovery(samples, **{**KW, "hold_seconds": 300.0})
+    assert r.recovered is True
+    assert r.band_enter_ts == BASE + dt.timedelta(minutes=75.0)
+    assert r.recovered_at == BASE + dt.timedelta(minutes=80.0)
+
+    # 若错误地把首段当作连续：会从事件时刻累计 600s 而提前恢复
+    early = analyze_recovery(samples, **{**KW, "hold_seconds": 600.0})
+    assert early.recovered is False
+    assert early.reason == DWELL_INCOMPLETE_AT_HORIZON
+
+    # max_gap 放宽到 900（恰好等于仍连续）：从事件时刻起累计 600s，
+    # 在 01:10 确认
+    wide = analyze_recovery(
+        samples, **{**KW, "hold_seconds": 600.0, "max_gap_seconds": 900.0}
+    )
+    assert wide.recovered is True
+    assert wide.band_enter_ts == EVENT
+    assert wide.recovered_at == BASE + dt.timedelta(minutes=70.0)
+
+
+def test_first_segment_gap_with_single_post_reading_never_starts():
+    # 首段断开后只剩一条孤立的事件后读数（在带内）：没有任何正长度
+    # 有效区间，不能凭“事件时刻 + 孤立读数都在带内”判恢复或中断
+    samples = BASELINE + [
+        Sample(EVENT, 20.0, 50.0),
+        _at(75, 20.0, 50.0),
+    ]
+    r = analyze_recovery(samples, **{**KW, "hold_seconds": 300.0})
+    assert r.recovered is False
+    assert r.band_enter_ts is None
+    assert r.reason == NEVER_SIMULTANEOUSLY_IN_BAND
+
+
+def test_first_segment_gap_then_exit_interrupts_restarted_timer():
+    # 首段断档后，01:15→01:20 在带（重新计时），随后 01:25 出带：
+    # 保持计时被出带终结 → dwell_interrupted，而非观察窗末保持不足
+    samples = BASELINE + [
+        Sample(EVENT, 20.0, 50.0),
+        _at(75, 20.0, 50.0),
+        _at(80, 20.0, 50.0),
+        _at(85, 20.0, 60.0),
+    ]
+    r = analyze_recovery(samples, **{**KW, "hold_seconds": 600.0})
+    assert r.recovered is False
+    assert r.reason == DWELL_INTERRUPTED
+
+
+def test_first_segment_gap_out_of_band_never_simultaneously_in_band():
+    # 首段既断档、事件后读数又在带外：归类为从未两维同时在带
+    samples = BASELINE + [
+        Sample(EVENT, 20.0, 50.0),
+        _at(75, 30.0, 80.0),
+    ]
+    r = analyze_recovery(samples, **KW)
+    assert r.recovered is False
+    assert r.reason == NEVER_SIMULTANEOUSLY_IN_BAND
+
+
+def test_dwell_continuity_across_first_segment_boundary():
+    # 事件时刻读数在带内：首段 [01:00, 01:05] 在带，并与后续线段在
+    # 01:05 读数时刻相接 → 连续计时；hold=600 恰在 01:10 确认。
+    samples = BASELINE + [
+        Sample(EVENT, 20.0, 50.0),
+        _at(65, 20.0, 50.0),
+        _at(70, 20.0, 50.0),
+    ]
+    r = analyze_recovery(samples, **{**KW, "hold_seconds": 600.0})
+    assert r.recovered is True
+    assert r.band_enter_ts == EVENT
+    assert r.recovered_at == BASE + dt.timedelta(minutes=70.0)
+
+    # 跨首段延续后在 01:05→01:10 段内出带：计时按精确交点中断
+    exit_mid = samples[:-1] + [_at(70, 22.0, 58.0)]
+    r2 = analyze_recovery(exit_mid, **{**KW, "hold_seconds": 600.0})
+    assert r2.recovered is False
+    # 温度在 01:07:30 越出 21、湿度在 01:07 越出 52 → 仅保持 420s
+    assert r2.reason == DWELL_INTERRUPTED
+
+
+def test_event_ts_reading_excluded_from_post_count_and_max_deviation():
+    # 事件时刻读数是偏离最大的点，但它计入基线，绝不能计入事件后
+    # 读数数目与最大偏差
+    samples = BASELINE + [
+        Sample(EVENT, 30.0, 80.0),
+        _at(65, 22.0, 54.0),
+        _at(70, 20.0, 50.0),
+        _at(75, 20.0, 50.0),
+        _at(80, 20.0, 50.0),
+    ]
+    r = analyze_recovery(samples, **KW)
+    assert r.baseline.sample_count == 6
+    assert r.post_event_sample_count == 4
+    # 严格事件后读数的最大偏差来自 01:05 的 (22, 54)
+    assert r.max_temperature_deviation == pytest.approx(2.0)
+    assert r.max_temperature_deviation_ts == BASE + dt.timedelta(minutes=65)
+    assert r.max_humidity_deviation == pytest.approx(4.0)
+    assert r.max_humidity_deviation_ts == BASE + dt.timedelta(minutes=65)
+
+
 def test_insufficient_baseline_samples_raises():
     with pytest.raises(InsufficientBaselineSamples) as exc:
         analyze_recovery(BASELINE[:2] + [_at(70, 30.0, 80.0)], **KW)
@@ -351,6 +505,25 @@ def test_endpoint_recovers(client):
     assert body["horizon_end"].startswith("2026-09-01T03:00:00")
     assert body["hold_seconds"] == 300
     assert body["max_gap_seconds"] == 600
+
+
+def test_endpoint_first_segment_recovers(client):
+    # 事件时刻读数计入基线并兼作首段左端点：首段 [01:00, 01:05]
+    # 两维恒在带内恰为 hold=300s，旧实现漏算首段会判未恢复。
+    rows = [_reading("RC-1F", i, 20.0, 50.0) for i in (10, 20, 30, 40, 50)]
+    rows.append(_reading("RC-1F", 60, 20.0, 50.0))  # 恰在事件时刻
+    rows.append(_reading("RC-1F", 65, 20.0, 50.0))  # 首条事件后读数
+    _ingest(client, "RC-1F", rows)
+    body = client.get(
+        "/api/v1/cases/RC-1F/recovery", params=_params()
+    ).json()
+    assert body["recovered"] is True
+    assert body["band_enter_ts"].startswith("2026-09-01T01:00:00")
+    assert body["recovered_at"].startswith("2026-09-01T01:05:00")
+    assert body["recovery_seconds"] == pytest.approx(300.0)
+    # 事件时刻读数计入基线，但不计入事件后读数数目
+    assert body["baseline_sample_count"] == 6
+    assert body["post_event_sample_count"] == 1
 
 
 def test_endpoint_not_recovered_returns_reason(client):
